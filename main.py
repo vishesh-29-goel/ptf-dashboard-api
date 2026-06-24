@@ -122,25 +122,6 @@ def get_stats():
 
     # Accuracy: correct = (is_true_positive=1 → PEND_L2) or (is_true_positive=0 → PASS_L1)
     cur.execute("""
-        SELECT
-            COUNT(*) AS screened,
-            COUNT(*) FILTER (
-                WHERE (pm.is_true_positive = 1 AND sr.final_decision = 'PEND_L2')
-                   OR (pm.is_true_positive = 0 AND sr.final_decision = 'PASS_L1')
-            ) AS correct
-        FROM (
-            SELECT DISTINCT ON (sr.payment_id)
-                sr.final_decision, pm.is_true_positive
-            FROM ptf_screening_results_v2 sr
-            JOIN ptf_payment_messages_v2 pm ON pm.id = sr.payment_id
-            ORDER BY sr.payment_id, sr.id DESC
-        ) sub
-        JOIN ptf_payment_messages_v2 pm ON pm.is_true_positive = sub.is_true_positive
-        LIMIT 1
-    """)
-
-    # Simpler accuracy query
-    cur.execute("""
         WITH latest AS (
             SELECT DISTINCT ON (sr.payment_id)
                 sr.final_decision,
