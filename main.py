@@ -102,17 +102,26 @@ def get_stats():
     cur = conn.cursor()
 
     cur.execute("""
+        WITH latest AS (
+            SELECT DISTINCT ON (sr.payment_id)
+                sr.payment_id,
+                sr.final_decision,
+                sr.elapsed_time_ms,
+                sr.created_at,
+                pm.scenario_group_id
+            FROM ptf_screening_results_v2 sr
+            JOIN ptf_payment_messages_v2 pm ON pm.id = sr.payment_id
+            ORDER BY sr.payment_id, sr.id DESC
+        )
         SELECT
-            COUNT(DISTINCT sr.id)                                            AS total_screened,
-            COUNT(DISTINCT sr.id) FILTER (WHERE sr.final_decision = 'PASS_L1')  AS passed,
-            COUNT(DISTINCT sr.id) FILTER (WHERE sr.final_decision = 'PEND_L2')  AS pend_l2,
-            COUNT(DISTINCT sr.id) FILTER (WHERE sr.final_decision = 'PEND_L1')  AS pend_l1,
-            COUNT(DISTINCT sg.id)                                            AS total_groups,
-            ROUND(AVG(sr.elapsed_time_ms)::numeric, 0)                      AS avg_elapsed_ms,
-            MAX(sr.created_at)                                               AS last_run_at
-        FROM ptf_screening_results_v2 sr
-        JOIN ptf_payment_messages_v2 pm ON pm.id = sr.payment_id
-        JOIN ptf_scenario_groups sg ON sg.id = pm.scenario_group_id
+            COUNT(*)                                                         AS total_screened,
+            COUNT(*) FILTER (WHERE final_decision = 'PASS_L1')              AS passed,
+            COUNT(*) FILTER (WHERE final_decision = 'PEND_L2')              AS pend_l2,
+            COUNT(*) FILTER (WHERE final_decision = 'PEND_L1')              AS pend_l1,
+            COUNT(DISTINCT scenario_group_id)                               AS total_groups,
+            ROUND(AVG(elapsed_time_ms)::numeric, 0)                         AS avg_elapsed_ms,
+            MAX(created_at)                                                  AS last_run_at
+        FROM latest
     """)
     row = cur.fetchone()
     cols = [d[0] for d in cur.description]
@@ -156,19 +165,27 @@ def get_groups():
     conn = get_db()
     cur = conn.cursor()
     cur.execute("""
+        WITH latest AS (
+            SELECT DISTINCT ON (sr.payment_id)
+                sr.payment_id,
+                sr.final_decision,
+                sr.created_at
+            FROM ptf_screening_results_v2 sr
+            ORDER BY sr.payment_id, sr.id DESC
+        )
         SELECT
             sg.id,
             sg.group_name,
             sg.description,
-            COUNT(DISTINCT pm.id)                                                AS alert_count,
-            COUNT(DISTINCT sr.id)                                                AS result_count,
-            COUNT(DISTINCT sr.id) FILTER (WHERE sr.final_decision = 'PASS_L1')  AS passed,
-            COUNT(DISTINCT sr.id) FILTER (WHERE sr.final_decision = 'PEND_L2')  AS pend_l2,
-            COUNT(DISTINCT sr.id) FILTER (WHERE sr.final_decision = 'PEND_L1')  AS pend_l1,
-            MAX(sr.created_at)                                                   AS last_run_at
+            COUNT(DISTINCT pm.id)                                               AS alert_count,
+            COUNT(DISTINCT l.payment_id)                                        AS result_count,
+            COUNT(DISTINCT l.payment_id) FILTER (WHERE l.final_decision = 'PASS_L1') AS passed,
+            COUNT(DISTINCT l.payment_id) FILTER (WHERE l.final_decision = 'PEND_L2') AS pend_l2,
+            COUNT(DISTINCT l.payment_id) FILTER (WHERE l.final_decision = 'PEND_L1') AS pend_l1,
+            MAX(l.created_at)                                                   AS last_run_at
         FROM ptf_scenario_groups sg
         LEFT JOIN ptf_payment_messages_v2 pm ON pm.scenario_group_id = sg.id
-        LEFT JOIN ptf_screening_results_v2 sr ON sr.payment_id = pm.id
+        LEFT JOIN latest l ON l.payment_id = pm.id
         GROUP BY sg.id, sg.group_name, sg.description
         ORDER BY last_run_at DESC NULLS LAST, sg.group_name
     """)
