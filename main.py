@@ -420,3 +420,111 @@ def get_runs(
     runs = rows_to_dicts(cur)
     cur.close()
     return {"runs": runs}
+
+
+# ── HITL Review endpoint ─────────────────────────────────────────────────────
+
+from pydantic import BaseModel
+
+class ReviewPayload(BaseModel):
+    scenario_id: str
+    decision: str          # CLOSE_CLEAR | CLOSE_ESCALATE | CLOSE_BLOCK
+    reviewer: str
+    notes: str = ""
+
+@app.post("/api/review")
+def post_review(payload: ReviewPayload):
+    """
+    Submit a human review decision for a PEND_L1/PEND_L2 case.
+    Writes a review record and marks the case as human-reviewed.
+    """
+    import json as _json
+    allowed = {"CLOSE_CLEAR", "CLOSE_ESCALATE", "CLOSE_BLOCK"}
+    if payload.decision not in allowed:
+        raise HTTPException(status_code=400, detail=f"decision must be one of {allowed}")
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    # Ensure table exists
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ptf_human_reviews (
+            id            SERIAL PRIMARY KEY,
+            scenario_id   TEXT NOT NULL,
+            decision      TEXT NOT NULL,
+            reviewer      TEXT NOT NULL,
+            notes         TEXT,
+            reviewed_at   TIMESTAMPTZ DEFAULT NOW()
+        )
+    """)
+
+    cur.execute("""
+        INSERT INTO ptf_human_reviews (scenario_id, decision, reviewer, notes)
+        VALUES (%s, %s, %s, %s)
+        RETURNING id, reviewed_at
+    """, (payload.scenario_id, payload.decision, payload.reviewer, payload.notes))
+    row = cur.fetchone()
+    review_id, reviewed_at = row
+
+    cur.close()
+    return {
+        "ok": True,
+        "review_id": review_id,
+        "scenario_id": payload.scenario_id,
+        "decision": payload.decision,
+        "reviewed_at": reviewed_at.isoformat()
+    }
+
+
+@app.get("/api/insights")
+def get_insights(limit: int = Query(20, ge=1, le=100)):
+    """
+    Intelligence Layer KB audit entries — proposed changes, evidence, approval status.
+    """
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, batch_id, status, proposed_changes, evidence,
+               approved_by, approved_at, applied_at, created_at
+        FROM ptf_kb_audit
+        ORDER BY id DESC
+        LIMIT %s
+    """, (limit,))
+    rows = rows_to_dicts(cur)
+    cur.close()
+    return {"insights": rows}
+
+
+class InsightApproval(BaseModel):
+    audit_id: int
+    action: str    # approve | reject
+    reviewer: str
+
+@app.post("/api/insights/review")
+def review_insight(payload: InsightApproval):
+    """Approve or reject an Intelligence Layer KB proposal."""
+    if payload.action not in {"approve", "reject"}:
+        raise HTTPException(status_code=400, detail="action must be 'approve' or 'reject'")
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    new_status = "approved" if payload.action == "approve" else "rejected"
+    cur.execute("""
+        UPDATE ptf_kb_audit
+        SET status = %s, approved_by = %s, approved_at = NOW()
+        WHERE id = %s
+        RETURNING id, status, approved_by, approved_at
+    """, (new_status, payload.reviewer, payload.audit_id))
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Audit entry {payload.audit_id} not found")
+
+    cur.close()
+    return {
+        "ok": True,
+        "audit_id": row[0],
+        "status": row[1],
+        "approved_by": row[2],
+        "approved_at": row[3].isoformat() if row[3] else None
+    }
