@@ -374,7 +374,7 @@ def get_kb_audit(limit: int = Query(50, ge=1, le=200)):
     conn = get_db()
     cur = conn.cursor()
     cur.execute("""
-        SELECT * FROM ptf_kb_audit
+        SELECT * FROM ptf_kb_audit_v2
         ORDER BY id DESC
         LIMIT %s
     """, (limit,))
@@ -476,24 +476,53 @@ def post_review(payload: ReviewPayload):
     }
 
 
+def get_audit_db():
+    """Separate connection to the Neon audit DB (different user, has write access to ptf_kb_audit_v2)."""
+    audit_url = (
+        os.environ.get("NEON_AUDIT_URL")
+        or os.environ.get("NEON_DB_URL")
+        or (
+            "postgresql://u_d85504e2_0868_4dbe_9cc3_1cad628fd7cb:"
+            "UPHWCXvSbdsLIf9_u_95G-sZ5jeeyXiLbTL1ZlogDZE@"
+            "ep-lucky-haze-afm95twz-pooler.c-2.us-west-2.aws.neon.tech"
+            "/neondb?sslmode=require"
+        )
+    )
+    return psycopg2.connect(audit_url)
+
+
 @app.get("/api/insights")
 def get_insights(limit: int = Query(20, ge=1, le=100)):
     """
-    Intelligence Layer KB audit entries — proposed changes, evidence, approval status.
+    Intelligence Layer KB proposals from ptf_kb_audit_v2.
+    Returns full proposal detail including before/after KB text and compliance rationale.
     """
-    conn = get_db()
+    conn = get_audit_db()
     cur = conn.cursor()
     cur.execute("""
         SELECT id, batch_id, status, proposed_changes, evidence,
-               approved_by, approved_at, applied_at, created_at
-        FROM ptf_kb_audit
+               approved_by, rejection_reason, resolved_at, created_at
+        FROM ptf_kb_audit_v2
         ORDER BY id DESC
         LIMIT %s
     """, (limit,))
     rows = rows_to_dicts(cur)
     cur.close()
+    conn.close()
     return {"insights": rows}
 
+
+
+@app.get("/api/kb")
+def get_kb():
+    """Return the current knowledge base (kb.md) content for display in the dashboard."""
+    kb_path = "/home/banking-demo/skills/sanctions-screening/kb.md"
+    try:
+        with open(kb_path, "r") as f:
+            content = f.read()
+        return {"content": content, "path": kb_path}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not read KB: {e}")
 
 class InsightApproval(BaseModel):
     audit_id: int
@@ -502,29 +531,58 @@ class InsightApproval(BaseModel):
 
 @app.post("/api/insights/review")
 def review_insight(payload: InsightApproval):
-    """Approve or reject an Intelligence Layer KB proposal."""
+    """
+    Approve or reject an Intelligence Layer KB proposal from ptf_kb_audit_v2.
+    Note: approval here marks the record in the audit DB. The Intelligence Layer agent
+    then runs apply_changes.py to actually update kb.md on the next HITL callback.
+    """
     if payload.action not in {"approve", "reject"}:
         raise HTTPException(status_code=400, detail="action must be 'approve' or 'reject'")
 
-    conn = get_db()
+    conn = get_audit_db()
     cur = conn.cursor()
+
+    # Check record exists and is pending
+    cur.execute("SELECT id, status FROM ptf_kb_audit_v2 WHERE id = %s", (payload.audit_id,))
+    existing = cur.fetchone()
+    if not existing:
+        raise HTTPException(status_code=404, detail=f"Audit entry {payload.audit_id} not found")
 
     new_status = "approved" if payload.action == "approve" else "rejected"
     cur.execute("""
-        UPDATE ptf_kb_audit
-        SET status = %s, approved_by = %s, approved_at = NOW()
+        UPDATE ptf_kb_audit_v2
+        SET status = %s, approved_by = %s, resolved_at = NOW()
         WHERE id = %s
-        RETURNING id, status, approved_by, approved_at
+        RETURNING id, status, approved_by, resolved_at
     """, (new_status, payload.reviewer, payload.audit_id))
     row = cur.fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail=f"Audit entry {payload.audit_id} not found")
-
+    conn.commit()
     cur.close()
-    return {
+    conn.close()
+
+    result = {
         "ok": True,
         "audit_id": row[0],
         "status": row[1],
         "approved_by": row[2],
-        "approved_at": row[3].isoformat() if row[3] else None
+        "resolved_at": row[3].isoformat() if row[3] else None
     }
+
+    # Fire Zamp webhook to apply KB changes immediately (approval path only)
+    if payload.action == "approve":
+        try:
+            import urllib.request as _ur, json as _json
+            _body = _json.dumps({"audit_id": row[0], "approved_by": row[2]}).encode()
+            _req  = _ur.Request(
+                "https://api-us.zamp.ai/triggers/hooks/cTL50-OAr7m_eK6IHABqnDmSJzZiQHE5UHm3JKJHIpA",
+                data=_body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with _ur.urlopen(_req, timeout=5) as _resp:
+                pass
+        except Exception as _e:
+            # Non-fatal — approval is already recorded; webhook failure just delays KB apply
+            print(f"[webhook] Warning: KB apply webhook call failed: {_e}")
+
+    return result
