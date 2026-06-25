@@ -491,7 +491,8 @@ def get_insights(limit: int = Query(20, ge=1, le=100)):
     cur = conn.cursor()
     cur.execute("""
         SELECT id, batch_id, status, proposed_changes, evidence,
-               approved_by, rejection_reason, resolved_at, created_at
+               approved_by, rejection_reason, resolved_at, created_at,
+               conversation_id
         FROM ptf_kb_audit_v2
         ORDER BY id DESC
         LIMIT %s
@@ -576,3 +577,104 @@ def review_insight(payload: InsightApproval):
             print(f"[webhook] Warning: KB apply webhook call failed: {_e}")
 
     return result
+
+
+# ── Resume Intelligence Layer agent via Conversations API ───────────────────
+
+class ResumePayload(BaseModel):
+    audit_id: int
+    action: str   # approve | reject
+    reviewer: str
+    reason: Optional[str] = None
+
+@app.post("/api/insights/resume")
+def resume_intelligence_agent(payload: ResumePayload):
+    """
+    Resume a paused Intelligence Layer agent by sending a follow-up message
+    to its Conversations API session.
+
+    Looks up the conversation_id stored in ptf_kb_audit_v2, then POSTs
+    the reviewer's decision to POST /api/v1/conversations/{id}/messages.
+
+    Returns ok=True on success, with the conversation_id used.
+    """
+    if payload.action not in {"approve", "reject"}:
+        raise HTTPException(status_code=400, detail="action must be 'approve' or 'reject'")
+
+    # Look up the conversation_id for this audit record
+    conn = get_audit_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, status, conversation_id FROM ptf_kb_audit_v2 WHERE id = %s",
+        (payload.audit_id,)
+    )
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Audit entry {payload.audit_id} not found")
+
+    audit_id, current_status, conversation_id = row
+
+    if not conversation_id:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Audit entry {audit_id} has no conversation_id. "
+                "The Intelligence Layer agent may not have stored it yet, "
+                "or this batch pre-dates the conversation tracking feature."
+            )
+        )
+
+    # Build the message to send to the waiting agent
+    if payload.action == "approve":
+        message = (
+            f"APPROVED by {payload.reviewer}. "
+            "Please apply the KB changes now using apply_changes.py."
+        )
+    else:
+        reason_text = payload.reason or "No reason provided"
+        message = (
+            f"REJECTED by {payload.reviewer}. Reason: {reason_text}. "
+            "Please reject the proposals using apply_changes.py --reject."
+        )
+
+    # Call the Conversations API to resume the agent
+    zamp_base = os.environ.get("ZAMP_BASE_URL", "https://api-us.zamp.ai")
+    zamp_token = os.environ.get("ZAMP_API_KEY")
+
+    if not zamp_token:
+        raise HTTPException(status_code=503, detail="ZAMP_API_KEY not configured on server")
+
+    import urllib.request as _ur
+    import json as _json
+
+    url = f"{zamp_base}/api/v1/conversations/{conversation_id}/messages"
+    body = _json.dumps({"message": message}).encode()
+    req = _ur.Request(
+        url,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {zamp_token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with _ur.urlopen(req, timeout=10) as resp:
+            resp_body = _json.loads(resp.read().decode())
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to resume agent conversation: {e}"
+        )
+
+    return {
+        "ok": True,
+        "audit_id": audit_id,
+        "conversation_id": conversation_id,
+        "action": payload.action,
+        "message_sent": message,
+        "api_response": resp_body,
+    }
