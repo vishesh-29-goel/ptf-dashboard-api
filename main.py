@@ -477,18 +477,8 @@ def post_review(payload: ReviewPayload):
 
 
 def get_audit_db():
-    """Separate connection to the Neon audit DB (different user, has write access to ptf_kb_audit_v2)."""
-    audit_url = (
-        os.environ.get("NEON_AUDIT_URL")
-        or os.environ.get("NEON_DB_URL")
-        or (
-            "postgresql://u_d85504e2_0868_4dbe_9cc3_1cad628fd7cb:"
-            "UPHWCXvSbdsLIf9_u_95G-sZ5jeeyXiLbTL1ZlogDZE@"
-            "ep-lucky-haze-afm95twz-pooler.c-2.us-west-2.aws.neon.tech"
-            "/neondb?sslmode=require"
-        )
-    )
-    return psycopg2.connect(audit_url)
+    """Returns a connection to the agent-managed DB — single source of truth for ptf_kb_audit_v2."""
+    return get_db()
 
 
 @app.get("/api/insights")
