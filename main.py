@@ -617,27 +617,25 @@ def resume_intelligence_agent(payload: ResumePayload):
 
     audit_id, current_status, conversation_id = row
 
-    if not conversation_id:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"Audit entry {audit_id} has no conversation_id. "
-                "The Intelligence Layer agent may not have stored it yet, "
-                "or this batch pre-dates the conversation tracking feature."
-            )
-        )
+    # Always use the standing conversation — one fixed channel for all batches.
+    # The audit_id in the message tells the agent which batch to act on.
+    STANDING_CONVERSATION_ID = "70992790-b11e-4d6e-a85c-a85b4693d34e"
+    conversation_id = STANDING_CONVERSATION_ID
 
-    # Build the message to send to the waiting agent
+    # Build the message — audit_id is included so the agent knows which record to apply
     if payload.action == "approve":
         message = (
-            f"APPROVED by {payload.reviewer}. "
-            "Please apply the KB changes now using apply_changes.py."
+            f"APPROVED by {payload.reviewer}. audit_id: {audit_id}. "
+            "Please apply the KB changes now using apply_changes.py "
+            f"--audit-id {audit_id} --approved-by \"{payload.reviewer}\"."
         )
     else:
         reason_text = payload.reason or "No reason provided"
         message = (
-            f"REJECTED by {payload.reviewer}. Reason: {reason_text}. "
-            "Please reject the proposals using apply_changes.py --reject."
+            f"REJECTED by {payload.reviewer}. audit_id: {audit_id}. "
+            f"Reason: {reason_text}. "
+            "Please reject the proposals using apply_changes.py "
+            f"--audit-id {audit_id} --reject --reason \"{reason_text}\"."
         )
 
     # Call the Conversations API to resume the agent
