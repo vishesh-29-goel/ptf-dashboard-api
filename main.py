@@ -82,6 +82,8 @@ def rows_to_dicts(cur) -> list[dict]:
         for c, v in zip(cols, row):
             if isinstance(v, datetime):
                 d[c] = v.isoformat()
+            elif v == 'None':
+                d[c] = None  # coerce Python repr string to actual null
             else:
                 d[c] = v
         result.append(d)
@@ -243,6 +245,7 @@ def get_alerts(
             pm.id               AS payment_id,
             pm.is_true_positive,
             pm.payment_json,
+            pm.sanctions_hit_data,
             sg.group_name,
             sg.id               AS group_id,
             CASE
