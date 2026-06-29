@@ -687,14 +687,31 @@ def resume_intelligence_agent(payload: ResumePayload):
         },
         method="POST",
     )
+    notify_ok = False
+    resp_body = None
+    notify_error = None
     try:
         with _ur.urlopen(req, timeout=10) as resp:
             resp_body = _json.loads(resp.read().decode())
+            notify_ok = True
     except Exception as e:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Failed to resume agent conversation: {e}"
+        notify_error = str(e)
+        print(f"[resume] Warning: Conversations API notify failed (best-effort): {e}")
+
+    # Update audit record status regardless of notify result
+    try:
+        _conn = get_audit_db()
+        _cur = _conn.cursor()
+        _new_status = "approved" if payload.action == "approve" else "rejected"
+        _cur.execute(
+            "UPDATE ptf_kb_audit_v2 SET status = %s, approved_by = %s, resolved_at = NOW() WHERE id = %s",
+            (_new_status, payload.reviewer, audit_id)
         )
+        _conn.commit()
+        _cur.close()
+        _conn.close()
+    except Exception as db_e:
+        print(f"[resume] Warning: DB status update failed: {db_e}")
 
     return {
         "ok": True,
@@ -702,6 +719,8 @@ def resume_intelligence_agent(payload: ResumePayload):
         "conversation_id": conversation_id,
         "action": payload.action,
         "message_sent": message,
+        "notify_sent": notify_ok,
+        "notify_error": notify_error,
         "api_response": resp_body,
     }
 
