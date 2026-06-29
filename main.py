@@ -505,7 +505,6 @@ def get_insights(limit: int = Query(20, ge=1, le=100)):
     cur2 = conn.cursor()
     cur2.execute("""
         SELECT trigger_source, COUNT(*) FROM ptf_kb_audit_v2
-        WHERE status = 'pending'
         GROUP BY trigger_source
     """)
     tab_counts = {r[0]: r[1] for r in cur2.fetchall()}
