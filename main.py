@@ -227,7 +227,6 @@ def get_alerts(
             SELECT DISTINCT ON (sr.payment_id)
                 sr.id          AS result_id,
                 sr.payment_id,
-                sr.scenario_id,
                 sr.final_decision,
                 sr.narrative_summary,
                 sr.elapsed_time_ms,
@@ -237,7 +236,7 @@ def get_alerts(
         )
         SELECT
             lr.result_id,
-            lr.scenario_id,
+            pm.scenario_id,
             lr.final_decision,
             lr.narrative_summary,
             lr.elapsed_time_ms,
