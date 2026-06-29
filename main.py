@@ -695,7 +695,7 @@ def resume_intelligence_agent(payload: ResumePayload):
     }
 
 
-# ── PEND_L2 False Positive Close endpoint ─────────────────────────────────────
+# ── PEND_L2 False Positive Close endpoint ─────────────────────────────────
 
 class PendL2ClosePayload(BaseModel):
     scenario_id: str
@@ -706,28 +706,18 @@ class PendL2ClosePayload(BaseModel):
 def close_pend_l2_false_positive(payload: PendL2ClosePayload):
     """
     Called when a PEND_L2 case is resolved as a false positive by an analyst.
-    Records the disposition and creates a pending Intelligence Layer audit record
-    so the pattern can be analysed and a KB improvement proposed.
-
-    This is the PEND_L2 trigger path for the Intelligence Layer.
+    1. Records the disposition in ptf_human_reviews.
+    2. Creates a pending ptf_kb_audit_v2 record (trigger_source=pend_l2_false_positive).
+    3. Runs analyse_pend_l2_fp.py to enrich the record with full case analysis.
+    4. Sends the structured report to the Intelligence Layer standing conversation.
     """
     import json as _json
-    from datetime import timezone
+    import subprocess as _sp
 
     conn = get_db()
     cur = conn.cursor()
 
-    # 1. Record the false-positive disposition in ptf_human_reviews
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS ptf_human_reviews (
-            id            SERIAL PRIMARY KEY,
-            scenario_id   TEXT NOT NULL,
-            decision      TEXT NOT NULL,
-            reviewer      TEXT NOT NULL,
-            notes         TEXT,
-            reviewed_at   TIMESTAMPTZ DEFAULT NOW()
-        )
-    """)
+    # 1. Record the false-positive disposition
     cur.execute("""
         INSERT INTO ptf_human_reviews (scenario_id, decision, reviewer, notes)
         VALUES (%s, 'CLOSE_FALSE_POSITIVE', %s, %s)
@@ -735,23 +725,32 @@ def close_pend_l2_false_positive(payload: PendL2ClosePayload):
     """, (payload.scenario_id, payload.reviewer, payload.notes))
     review_id, reviewed_at = cur.fetchone()
 
-    # 2. Fetch the screening result + LLM audit trail for this case
+    # 2. Fetch case context for evidence summary
     cur.execute("""
         SELECT pm.id, pm.scenario_id, pm.is_true_positive, pm.payment_json,
-               sg.group_name,
-               sr.final_decision, sr.narrative_summary, sr.investigator_output
+               sg.group_name, sr.final_decision, sr.narrative_summary
         FROM ptf_payment_messages_v2 pm
         JOIN ptf_scenario_groups sg ON sg.id = pm.scenario_group_id
         LEFT JOIN LATERAL (
-            SELECT final_decision, narrative_summary, investigator_output
+            SELECT final_decision, narrative_summary
             FROM ptf_screening_results_v2
-            WHERE payment_id = pm.id
-            ORDER BY id DESC LIMIT 1
+            WHERE payment_id = pm.id ORDER BY id DESC LIMIT 1
         ) sr ON true
-        WHERE pm.scenario_id = %s
-        LIMIT 1
+        WHERE pm.scenario_id = %s LIMIT 1
     """, (payload.scenario_id,))
     alert = cur.fetchone()
+
+    if alert:
+        _, scenario_id, _, _, group_name, final_decision, narrative = alert
+        evidence = (
+            f"PEND_L2 false positive: {scenario_id} in group '{group_name}'. "
+            f"Engine decision: {final_decision}. Closed as false positive by {payload.reviewer}. "
+            f"Notes: {payload.notes or '(none)'}."
+        )
+        batch_id = f"pend_l2_fp_{scenario_id}"
+    else:
+        evidence = f"PEND_L2 false positive: {payload.scenario_id}. Closed by {payload.reviewer}."
+        batch_id = f"pend_l2_fp_{payload.scenario_id}"
 
     # 3. Read current KB snapshot
     kb_snapshot = ""
@@ -761,39 +760,40 @@ def close_pend_l2_false_positive(payload: PendL2ClosePayload):
     except Exception:
         pass
 
-    # 4. Build evidence summary for the audit record
-    if alert:
-        payment_id, scenario_id, is_tp, payment_json_raw, group_name, final_decision, narrative, investigator = alert
-        evidence = (
-            f"PEND_L2 false positive: {scenario_id} in group '{group_name}'. "
-            f"Agent decision: {final_decision}. Closed as false positive by {payload.reviewer}. "
-            f"Narrative: {(narrative or '')[:300]}"
-        )
-        batch_id = f"pend_l2_fp_{scenario_id}"
-    else:
-        evidence = f"PEND_L2 false positive: {payload.scenario_id}. Closed by {payload.reviewer}."
-        batch_id = f"pend_l2_fp_{payload.scenario_id}"
-
-    # 5. Write pending audit record with trigger_source = pend_l2_false_positive
+    # 4. Create pending audit record
     STANDING_CONVERSATION_ID = "70992790-b11e-4d6e-a85c-a85b4693d34e"
     cur.execute("""
         INSERT INTO ptf_kb_audit_v2
-            (batch_id, proposed_changes, evidence, status, before_snapshot,
-             conversation_id, trigger_source)
+            (batch_id, proposed_changes, evidence, status, before_snapshot, conversation_id, trigger_source)
         VALUES (%s, %s, %s, 'pending', %s, %s, 'pend_l2_false_positive')
         RETURNING id
     """, (
         batch_id,
-        _json.dumps({"scenario_id": payload.scenario_id, "trigger": "pend_l2_false_positive", "proposals": []}),
-        evidence,
-        kb_snapshot,
-        STANDING_CONVERSATION_ID,
+        _json.dumps({"trigger": "pend_l2_false_positive", "scenario_id": payload.scenario_id, "proposals": []}),
+        evidence, kb_snapshot, STANDING_CONVERSATION_ID,
     ))
     audit_id = cur.fetchone()[0]
     conn.commit()
     cur.close()
 
-    # 6. Notify Intelligence Layer via standing conversation
+    # 5. Run analyse_pend_l2_fp.py to enrich the audit record
+    script_output = ""
+    try:
+        result = _sp.run(
+            ["python3",
+             "/home/banking-demo/skills/ptf-intelligence-layer/scripts/analyse_pend_l2_fp.py",
+             "--scenario-id", payload.scenario_id,
+             "--audit-id", str(audit_id),
+             "--reviewer", payload.reviewer],
+            capture_output=True, text=True, timeout=30, env={**os.environ},
+        )
+        script_output = result.stdout
+        if result.returncode != 0:
+            print(f"[pend_l2_close] analyse stderr: {result.stderr[:500]}")
+    except Exception as e:
+        print(f"[pend_l2_close] Warning: script failed: {e}")
+
+    # 6. Notify Intelligence Layer with full report
     zamp_base = os.environ.get("ZAMP_BASE_URL", "https://api-us.zamp.ai")
     zamp_token = os.environ.get("ZAMP_API_KEY")
     notify_sent = False
@@ -801,10 +801,12 @@ def close_pend_l2_false_positive(payload: PendL2ClosePayload):
         try:
             import urllib.request as _ur
             message = (
-                f"PEND_L2 FALSE POSITIVE DETECTED. audit_id: {audit_id}. "
-                f"Scenario: {payload.scenario_id}. Closed by: {payload.reviewer}. "
-                f"Evidence: {evidence[:400]}. "
-                "Please analyse this false escalation and propose a KB improvement."
+                f"PEND_L2 FALSE POSITIVE -- INTELLIGENCE LAYER ANALYSIS REQUEST\n"
+                f"audit_id: {audit_id} | scenario_id: {payload.scenario_id} | closed_by: {payload.reviewer}\n"
+                f"trigger_source: pend_l2_false_positive\n\n"
+                f"Review the escalation cause, identify the KB gap, and propose a targeted KB tightening rule. "
+                f"Present via HITL then run apply_changes.py --audit-id {audit_id}.\n\n"
+                + (script_output[:6000] if script_output else evidence)
             )
             url = f"{zamp_base}/api/v1/conversations/{STANDING_CONVERSATION_ID}/messages"
             body = _json.dumps({"message": message}).encode()
@@ -824,4 +826,120 @@ def close_pend_l2_false_positive(payload: PendL2ClosePayload):
         "scenario_id": payload.scenario_id,
         "reviewed_at": reviewed_at.isoformat(),
         "intelligence_layer_notified": notify_sent,
+        "analysis_generated": bool(script_output),
+    }
+
+
+# ── PEND_L1 Conflict trigger endpoint ──────────────────────────────────────
+
+class PendL1TriggerPayload(BaseModel):
+    scenario_id: str
+
+@app.post("/api/pend-l1/trigger-analysis")
+def trigger_pend_l1_analysis(payload: PendL1TriggerPayload):
+    """
+    Triggered when a screening result is PEND_L1 (Investigator/Verifier conflict).
+    1. Creates a pending ptf_kb_audit_v2 record with trigger_source=pend_l1.
+    2. Runs analyse_pend_l1.py to produce the full conflict analysis report.
+    3. Sends the report to the Intelligence Layer for KB clarification proposal.
+    """
+    import json as _json
+    import subprocess as _sp
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT pm.id, pm.scenario_id, pm.is_true_positive,
+               sg.group_name, sr.final_decision
+        FROM ptf_payment_messages_v2 pm
+        JOIN ptf_scenario_groups sg ON sg.id = pm.scenario_group_id
+        LEFT JOIN LATERAL (
+            SELECT final_decision
+            FROM ptf_screening_results_v2
+            WHERE payment_id = pm.id ORDER BY id DESC LIMIT 1
+        ) sr ON true
+        WHERE pm.scenario_id = %s LIMIT 1
+    """, (payload.scenario_id,))
+    alert = cur.fetchone()
+
+    if alert:
+        _, scenario_id, _, group_name, final_decision = alert
+        evidence = (
+            f"PEND_L1 conflict: {scenario_id} in group '{group_name}'. "
+            f"Final decision: {final_decision}. Investigator/Verifier disagreement."
+        )
+        batch_id = f"pend_l1_{scenario_id}"
+    else:
+        evidence = f"PEND_L1 conflict: {payload.scenario_id}. Case not found in DB."
+        batch_id = f"pend_l1_{payload.scenario_id}"
+
+    kb_snapshot = ""
+    try:
+        with open("/home/banking-demo/skills/sanctions-screening/kb.md") as f:
+            kb_snapshot = f.read()
+    except Exception:
+        pass
+
+    STANDING_CONVERSATION_ID = "70992790-b11e-4d6e-a85c-a85b4693d34e"
+    cur.execute("""
+        INSERT INTO ptf_kb_audit_v2
+            (batch_id, proposed_changes, evidence, status, before_snapshot, conversation_id, trigger_source)
+        VALUES (%s, %s, %s, 'pending', %s, %s, 'pend_l1')
+        RETURNING id
+    """, (
+        batch_id,
+        _json.dumps({"trigger": "pend_l1", "scenario_id": payload.scenario_id, "proposals": []}),
+        evidence, kb_snapshot, STANDING_CONVERSATION_ID,
+    ))
+    audit_id = cur.fetchone()[0]
+    conn.commit()
+    cur.close()
+
+    script_output = ""
+    try:
+        result = _sp.run(
+            ["python3",
+             "/home/banking-demo/skills/ptf-intelligence-layer/scripts/analyse_pend_l1.py",
+             "--scenario-id", payload.scenario_id,
+             "--audit-id", str(audit_id)],
+            capture_output=True, text=True, timeout=30, env={**os.environ},
+        )
+        script_output = result.stdout
+        if result.returncode != 0:
+            print(f"[pend_l1_trigger] analyse stderr: {result.stderr[:500]}")
+    except Exception as e:
+        print(f"[pend_l1_trigger] Warning: script failed: {e}")
+
+    zamp_base = os.environ.get("ZAMP_BASE_URL", "https://api-us.zamp.ai")
+    zamp_token = os.environ.get("ZAMP_API_KEY")
+    notify_sent = False
+    if zamp_token:
+        try:
+            import urllib.request as _ur
+            message = (
+                f"PEND_L1 CONFLICT -- INTELLIGENCE LAYER ANALYSIS REQUEST\n"
+                f"audit_id: {audit_id} | scenario_id: {payload.scenario_id}\n"
+                f"trigger_source: pend_l1\n\n"
+                f"Investigator and Verifier disagreed on this case. Identify the KB ambiguity "
+                f"and propose a clarification. Present via HITL then run apply_changes.py --audit-id {audit_id}.\n\n"
+                + (script_output[:6000] if script_output else evidence)
+            )
+            url = f"{zamp_base}/api/v1/conversations/{STANDING_CONVERSATION_ID}/messages"
+            body = _json.dumps({"message": message}).encode()
+            req = _ur.Request(url, data=body,
+                headers={"Authorization": f"Bearer {zamp_token}", "Content-Type": "application/json"},
+                method="POST")
+            with _ur.urlopen(req, timeout=10):
+                notify_sent = True
+        except Exception as e:
+            print(f"[pend_l1_trigger] Warning: notify failed: {e}")
+
+    return {
+        "ok": True,
+        "audit_id": audit_id,
+        "trigger_source": "pend_l1",
+        "scenario_id": payload.scenario_id,
+        "intelligence_layer_notified": notify_sent,
+        "analysis_generated": bool(script_output),
     }
