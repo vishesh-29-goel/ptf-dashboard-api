@@ -23,6 +23,8 @@ for the dashboard frontend.
 | Variable | Description |
 |----------|-------------|
 | `DATABASE_URL` | Postgres connection string (agent-managed DB) |
+| `ZAMP_API_KEY` | Zamp API key for Conversations API (Intelligence Layer resume path). Falls back to embedded key if not set. |
+| `ZAMP_BASE_URL` | Zamp API base URL (default: `https://api-us.zamp.ai`) |
 
 ## Deploy on Railway
 

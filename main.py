@@ -576,22 +576,36 @@ def review_insight(payload: InsightApproval):
         "resolved_at": row[3].isoformat() if row[3] else None
     }
 
-    # Fire Zamp webhook to apply KB changes immediately (approval path only)
-    if payload.action == "approve":
+    # Notify Intelligence Layer via Conversations API so it runs apply_changes.py
+    if payload.action in {"approve", "reject"}:
         try:
             import urllib.request as _ur, json as _json
-            _body = _json.dumps({"audit_id": row[0], "approved_by": row[2]}).encode()
-            _req  = _ur.Request(
-                "https://api-us.zamp.ai/triggers/hooks/cTL50-OAr7m_eK6IHABqnDmSJzZiQHE5UHm3JKJHIpA",
-                data=_body,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
+            _ZAMP_TOKEN = os.environ.get("ZAMP_API_KEY", "zamp_sk_a26cd5e1-bb86-4bc4-80fc-053b26f92a3f_rZYAQ2gbmHpMIMdZI7JLae8_es_ODNL6P72zoPCCQEWCjg7NyyiN8LsoBRlEPS3z")
+            _ZAMP_BASE  = os.environ.get("ZAMP_BASE_URL", "https://api-us.zamp.ai")
+            _CONV_ID    = "70992790-b11e-4d6e-a85c-a85b4693d34e"
+            if payload.action == "approve":
+                _msg = (
+                    f"APPROVED by {row[2]}. audit_id: {row[0]}. "
+                    f"Please apply the KB changes now using apply_changes.py "
+                    f"--audit-id {row[0]} --approved-by \"{row[2]}\"."
+                )
+            else:
+                _msg = (
+                    f"REJECTED by {row[2]}. audit_id: {row[0]}. "
+                    f"Reason: No reason provided. "
+                    f"Please reject the proposals using apply_changes.py "
+                    f"--audit-id {row[0]} --reject --reason \"No reason provided\"."
+                )
+            _url  = f"{_ZAMP_BASE}/api/v1/conversations/{_CONV_ID}/messages"
+            _body = _json.dumps({"message": _msg}).encode()
+            _req  = _ur.Request(_url, data=_body,
+                headers={"Authorization": f"Bearer {_ZAMP_TOKEN}", "Content-Type": "application/json"},
+                method="POST")
             with _ur.urlopen(_req, timeout=5) as _resp:
                 pass
         except Exception as _e:
-            # Non-fatal — approval is already recorded; webhook failure just delays KB apply
-            print(f"[webhook] Warning: KB apply webhook call failed: {_e}")
+            # Non-fatal — DB record already updated; agent notification is best-effort
+            print(f"[review] Warning: Conversations API notify failed: {_e}")
 
     return result
 
@@ -657,10 +671,7 @@ def resume_intelligence_agent(payload: ResumePayload):
 
     # Call the Conversations API to resume the agent
     zamp_base = os.environ.get("ZAMP_BASE_URL", "https://api-us.zamp.ai")
-    zamp_token = os.environ.get("ZAMP_API_KEY")
-
-    if not zamp_token:
-        raise HTTPException(status_code=503, detail="ZAMP_API_KEY not configured on server")
+    zamp_token = os.environ.get("ZAMP_API_KEY", "zamp_sk_a26cd5e1-bb86-4bc4-80fc-053b26f92a3f_rZYAQ2gbmHpMIMdZI7JLae8_es_ODNL6P72zoPCCQEWCjg7NyyiN8LsoBRlEPS3z")
 
     import urllib.request as _ur
     import json as _json
@@ -795,7 +806,7 @@ def close_pend_l2_false_positive(payload: PendL2ClosePayload):
 
     # 6. Notify Intelligence Layer with full report
     zamp_base = os.environ.get("ZAMP_BASE_URL", "https://api-us.zamp.ai")
-    zamp_token = os.environ.get("ZAMP_API_KEY")
+    zamp_token = os.environ.get("ZAMP_API_KEY", "zamp_sk_a26cd5e1-bb86-4bc4-80fc-053b26f92a3f_rZYAQ2gbmHpMIMdZI7JLae8_es_ODNL6P72zoPCCQEWCjg7NyyiN8LsoBRlEPS3z")
     notify_sent = False
     if zamp_token:
         try:
@@ -912,7 +923,7 @@ def trigger_pend_l1_analysis(payload: PendL1TriggerPayload):
         print(f"[pend_l1_trigger] Warning: script failed: {e}")
 
     zamp_base = os.environ.get("ZAMP_BASE_URL", "https://api-us.zamp.ai")
-    zamp_token = os.environ.get("ZAMP_API_KEY")
+    zamp_token = os.environ.get("ZAMP_API_KEY", "zamp_sk_a26cd5e1-bb86-4bc4-80fc-053b26f92a3f_rZYAQ2gbmHpMIMdZI7JLae8_es_ODNL6P72zoPCCQEWCjg7NyyiN8LsoBRlEPS3z")
     notify_sent = False
     if zamp_token:
         try:
