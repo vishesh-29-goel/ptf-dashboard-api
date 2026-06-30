@@ -233,11 +233,28 @@ def get_alerts(
                 sr.created_at  AS screened_at
             FROM ptf_screening_results_v2 sr
             ORDER BY sr.payment_id, sr.id DESC
+        ),
+        latest_reviews AS (
+            SELECT DISTINCT ON (scenario_id)
+                scenario_id,
+                decision        AS human_decision,
+                reviewer,
+                notes           AS human_notes,
+                reviewed_at
+            FROM ptf_human_reviews
+            ORDER BY scenario_id, reviewed_at DESC
         )
         SELECT
             lr.result_id,
             pm.scenario_id,
-            lr.final_decision,
+            COALESCE(
+                CASE hr.human_decision
+                    WHEN 'CLOSE_CLEAR'    THEN 'CLEAR'
+                    WHEN 'CLOSE_BLOCK'    THEN 'BLOCK'
+                    WHEN 'CLOSE_ESCALATE' THEN 'PEND_L2'
+                END,
+                lr.final_decision
+            )                   AS final_decision,
             lr.narrative_summary,
             lr.elapsed_time_ms,
             lr.screened_at,
@@ -247,6 +264,10 @@ def get_alerts(
             pm.sanctions_hit_data,
             sg.group_name,
             sg.id               AS group_id,
+            hr.human_decision,
+            hr.reviewer,
+            hr.human_notes,
+            hr.reviewed_at,
             CASE
                 WHEN (pm.is_true_positive = 1 AND lr.final_decision = 'PEND_L2')
                   OR (pm.is_true_positive = 0 AND lr.final_decision = 'PASS_L1')
@@ -255,6 +276,7 @@ def get_alerts(
         FROM latest_results lr
         JOIN ptf_payment_messages_v2 pm ON pm.id = lr.payment_id
         JOIN ptf_scenario_groups sg ON sg.id = pm.scenario_group_id
+        LEFT JOIN latest_reviews hr ON hr.scenario_id = pm.scenario_id
         {where_sql}
         ORDER BY lr.screened_at DESC
         LIMIT %s OFFSET %s
@@ -468,6 +490,7 @@ def post_review(payload: ReviewPayload):
     row = cur.fetchone()
     review_id, reviewed_at = row
 
+    conn.commit()
     cur.close()
     return {
         "ok": True,
