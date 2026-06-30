@@ -478,6 +478,43 @@ def post_review(payload: ReviewPayload):
     }
 
 
+class TriggerILPayload(BaseModel):
+    group_name: str
+    scenario_id: str
+    batch_id: str | None = None
+
+
+@app.post("/api/trigger-il")
+def trigger_intelligence_layer(payload: TriggerILPayload):
+    """
+    Fire the PTF Intelligence Layer webhook from the server side (avoids browser CORS).
+    Called by the dashboard after a human review is submitted.
+    """
+    import urllib.request as _ur, json as _json, datetime as _dt
+
+    IL_WEBHOOK = "https://api-us.zamp.ai/triggers/hooks/ACMVhqqRYXqhBQVs-ydEcse41xntJRHWt2Eae4jLanc"
+
+    batch_id = payload.batch_id or (
+        payload.group_name + "_" + _dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    )
+
+    body = _json.dumps({
+        "batch_id": batch_id,
+        "group_name": payload.group_name,
+        "pend_l2": [payload.scenario_id],
+        "pend_l1": [],
+    }).encode()
+
+    try:
+        req = _ur.Request(IL_WEBHOOK, data=body, headers={"Content-Type": "application/json"}, method="POST")
+        with _ur.urlopen(req, timeout=15) as r:
+            resp_text = r.read().decode()[:200]
+        return {"ok": True, "status": r.status, "response": resp_text}
+    except Exception as e:
+        # Non-fatal — log and return so the dashboard still shows success
+        return {"ok": False, "error": str(e)}
+
+
 def get_audit_db():
     """Returns a connection to the agent-managed DB — single source of truth for ptf_kb_audit_v2."""
     return get_db()
