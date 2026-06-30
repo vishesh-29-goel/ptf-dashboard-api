@@ -15,6 +15,8 @@ Deploy on Railway:
   Set DATABASE_URL in Railway environment variables.
 """
 
+import asyncio
+import json
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -24,6 +26,7 @@ import psycopg2
 import psycopg2.extras
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
 
 # ── DB connection pool (simple — one conn per process, Railway keeps it alive) ──
@@ -303,6 +306,99 @@ def get_alerts(
 
     cur.close()
     return {"total": total, "limit": limit, "offset": offset, "alerts": alerts}
+
+
+@app.get("/api/stream")
+async def stream_alerts(group: Optional[str] = Query(None)):
+    """
+    Server-Sent Events endpoint. Pushes a 'results' event whenever new screening
+    results land in the DB. The client connects once and receives live updates
+    without polling.
+    """
+    db_url = os.environ.get("DATABASE_URL")
+
+    async def event_generator():
+        last_max_id = 0
+        last_kb_audit_id = 0
+        conn = None
+
+        try:
+            conn = psycopg2.connect(db_url)
+            conn.autocommit = True
+
+            # Send an initial 'connected' ping so the browser knows the stream is live
+            yield "event: connected\ndata: {\"ok\": true}\n\n"
+
+            while True:
+                await asyncio.sleep(2)
+
+                try:
+                    cur = conn.cursor()
+
+                    # Check for new screening results
+                    where = "WHERE sg.group_name = %s" if group else ""
+                    params = [group] if group else []
+
+                    cur.execute(f"""
+                        SELECT MAX(sr.id)
+                        FROM ptf_screening_results_v2 sr
+                        JOIN ptf_payment_messages_v2 pm ON pm.id = sr.payment_id
+                        JOIN ptf_scenario_groups sg ON sg.id = pm.scenario_group_id
+                        {where}
+                    """, params)
+                    row = cur.fetchone()
+                    current_max_id = row[0] or 0
+
+                    # Check for new KB audit entries (IL proposals)
+                    cur.execute("SELECT MAX(id) FROM ptf_kb_audit_v2")
+                    kb_row = cur.fetchone()
+                    current_kb_audit_id = kb_row[0] or 0
+
+                    cur.close()
+
+                    if current_max_id > last_max_id or current_kb_audit_id > last_kb_audit_id:
+                        last_max_id = current_max_id
+                        last_kb_audit_id = current_kb_audit_id
+                        payload = json.dumps({
+                            "new_results": current_max_id > 0,
+                            "new_kb_proposals": current_kb_audit_id > last_kb_audit_id,
+                            "ts": datetime.utcnow().isoformat(),
+                        })
+                        yield f"event: update\ndata: {payload}\n\n"
+                    else:
+                        # Keepalive comment so Railway/proxies don't close the connection
+                        yield ": keepalive\n\n"
+
+                except Exception as db_err:
+                    # DB hiccup — try to reconnect and continue
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    try:
+                        conn = psycopg2.connect(db_url)
+                        conn.autocommit = True
+                    except Exception:
+                        pass
+                    yield f"event: error\ndata: {json.dumps({'msg': str(db_err)})}\n\n"
+
+        except Exception:
+            pass
+        finally:
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",   # tells Nginx/Railway not to buffer SSE
+        },
+    )
 
 
 @app.get("/api/alerts/{scenario_id}")
