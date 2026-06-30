@@ -606,37 +606,10 @@ class TriggerILPayload(BaseModel):
 @app.post("/api/trigger-il")
 def trigger_intelligence_layer(payload: TriggerILPayload, background_tasks: BackgroundTasks):
     """
-    Fire the PTF Intelligence Layer webhook from the server side (avoids browser CORS).
-    Called by the dashboard after a human review is submitted.
-
-    Fires immediately via a FastAPI BackgroundTask — no in-memory timer that
-    can be lost on process restart. The IL agent itself is idempotent.
+    Legacy endpoint kept for backwards compatibility.
+    IL is now triggered directly from the dashboard via /__zsvc/il-trigger-api/.
+    This endpoint is a no-op stub that returns ok=True immediately.
     """
-    import urllib.request as _ur, json as _json, datetime as _dt
-
-    IL_WEBHOOK = "https://api-us.zamp.ai/triggers/hooks/ACMVhqqRYXqhBQVs-ydEcse41xntJRHWt2Eae4jLanc"
-
-    def _fire():
-        import os as _os
-        batch_id = (payload.group_name or "batch") + "_" + _dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        body = _json.dumps({
-            "batch_id":        batch_id,
-            "group_name":      payload.group_name,
-            "pend_l2":         [payload.scenario_id],
-            "pend_l1":         [],
-            "ptf_database_url": _os.environ.get("DATABASE_URL", ""),
-        }).encode()
-        try:
-            req = _ur.Request(IL_WEBHOOK, data=body,
-                              headers={"Content-Type": "application/json"}, method="POST")
-            with _ur.urlopen(req, timeout=15):
-                pass
-            print(f"[IL trigger] fired for scenario={payload.scenario_id} group={payload.group_name}")
-        except Exception as e:
-            print(f"[IL trigger] webhook error (non-fatal): {e}")
-
-    background_tasks.add_task(_fire)
-
     return {
         "ok": True,
         "queued": payload.scenario_id,
