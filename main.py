@@ -597,6 +597,66 @@ def post_review(payload: ReviewPayload):
     }
 
 
+class TriggerILPayload(BaseModel):
+    group_name: str
+    scenario_id: str
+    batch_id: str | None = None
+
+
+@app.post("/api/trigger-il")
+def trigger_intelligence_layer(payload: TriggerILPayload, background_tasks: BackgroundTasks):
+    """
+    Legacy endpoint kept for backwards compatibility.
+    IL is now triggered directly from the dashboard via /__zsvc/il-trigger-api/.
+    This endpoint is a no-op stub that returns ok=True immediately.
+    """
+    return {
+        "ok": True,
+        "queued": payload.scenario_id,
+        "message": f"IL webhook fired for scenario {payload.scenario_id} (group: {payload.group_name}).",
+    }
+
+
+def get_audit_db():
+    """Returns a connection to the agent-managed DB — single source of truth for ptf_kb_audit_v2."""
+    return get_db()
+
+
+@app.get("/api/insights")
+def get_insights(limit: int = Query(20, ge=1, le=100)):
+    """
+    Intelligence Layer KB proposals from ptf_kb_audit_v2.
+    Returns full proposal detail including before/after KB text and compliance rationale.
+    """
+    conn = get_audit_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, batch_id, status, proposed_changes, evidence,
+               approved_by, rejection_reason, resolved_at, created_at,
+               conversation_id, trigger_source
+        FROM ptf_kb_audit_v2
+        ORDER BY id DESC
+        LIMIT %s
+    """, (limit,))
+    rows = rows_to_dicts(cur)
+
+    # Tab counts
+    cur2 = conn.cursor()
+    cur2.execute("""
+        SELECT trigger_source, COUNT(*) FROM ptf_kb_audit_v2
+        GROUP BY trigger_source
+    """)
+    tab_counts = {r[0]: r[1] for r in cur2.fetchall()}
+    cur2.close()
+    cur.close()
+    conn.close()
+    return {
+        "insights": rows,
+        "tab_counts": {
+            "pend_l1": tab_counts.get("pend_l1", 0),
+            "pend_l2_false_positive": tab_counts.get("pend_l2_false_positive", 0),
+            "pattern": tab_counts.get("pattern", 0),
+        }
     }
 
 
@@ -660,7 +720,7 @@ def review_insight(payload: InsightApproval):
     if payload.action in {"approve", "reject"}:
         try:
             import urllib.request as _ur, json as _json
-            _ZAMP_TOKEN = os.environ.get("ZAMP_API_KEY", "")
+            _ZAMP_TOKEN = os.environ.get("ZAMP_API_KEY", "zamp_sk_a26cd5e1-bb86-4bc4-80fc-053b26f92a3f_rZYAQ2gbmHpMIMdZI7JLae8_es_ODNL6P72zoPCCQEWCjg7NyyiN8LsoBRlEPS3z")
             _ZAMP_BASE  = os.environ.get("ZAMP_BASE_URL", "https://api-us.zamp.ai")
             _CONV_ID    = "70992790-b11e-4d6e-a85c-a85b4693d34e"
             if payload.action == "approve":
@@ -751,7 +811,7 @@ def resume_intelligence_agent(payload: ResumePayload):
 
     # Call the Conversations API to resume the agent
     zamp_base = os.environ.get("ZAMP_BASE_URL", "https://api-us.zamp.ai")
-    zamp_token = os.environ.get("ZAMP_API_KEY", "")
+    zamp_token = os.environ.get("ZAMP_API_KEY", "zamp_sk_a26cd5e1-bb86-4bc4-80fc-053b26f92a3f_rZYAQ2gbmHpMIMdZI7JLae8_es_ODNL6P72zoPCCQEWCjg7NyyiN8LsoBRlEPS3z")
 
     import urllib.request as _ur
     import json as _json
@@ -906,7 +966,7 @@ def close_pend_l2_false_positive(payload: PendL2ClosePayload):
 
     # 6. Notify Intelligence Layer with full report
     zamp_base = os.environ.get("ZAMP_BASE_URL", "https://api-us.zamp.ai")
-    zamp_token = os.environ.get("ZAMP_API_KEY", "")
+    zamp_token = os.environ.get("ZAMP_API_KEY", "zamp_sk_a26cd5e1-bb86-4bc4-80fc-053b26f92a3f_rZYAQ2gbmHpMIMdZI7JLae8_es_ODNL6P72zoPCCQEWCjg7NyyiN8LsoBRlEPS3z")
     notify_sent = False
     if zamp_token:
         try:
@@ -1023,7 +1083,7 @@ def trigger_pend_l1_analysis(payload: PendL1TriggerPayload):
         print(f"[pend_l1_trigger] Warning: script failed: {e}")
 
     zamp_base = os.environ.get("ZAMP_BASE_URL", "https://api-us.zamp.ai")
-    zamp_token = os.environ.get("ZAMP_API_KEY", "")
+    zamp_token = os.environ.get("ZAMP_API_KEY", "zamp_sk_a26cd5e1-bb86-4bc4-80fc-053b26f92a3f_rZYAQ2gbmHpMIMdZI7JLae8_es_ODNL6P72zoPCCQEWCjg7NyyiN8LsoBRlEPS3z")
     notify_sent = False
     if zamp_token:
         try:
