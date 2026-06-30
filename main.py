@@ -608,30 +608,67 @@ def trigger_intelligence_layer(payload: TriggerILPayload):
     """
     Fire the PTF Intelligence Layer webhook from the server side (avoids browser CORS).
     Called by the dashboard after a human review is submitted.
+
+    Debounced: resets a 30-second timer on every call. The IL only fires once
+    the timer expires with no new reviews — so multiple rapid HITL submissions
+    collapse into a single IL run that sees all of them.
     """
-    import urllib.request as _ur, json as _json, datetime as _dt
+    import urllib.request as _ur, json as _json, datetime as _dt, threading as _th
 
     IL_WEBHOOK = "https://api-us.zamp.ai/triggers/hooks/ACMVhqqRYXqhBQVs-ydEcse41xntJRHWt2Eae4jLanc"
+    DEBOUNCE_SECONDS = 30
 
-    batch_id = payload.batch_id or (
-        payload.group_name + "_" + _dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    )
+    # Module-level debounce state (survives across requests in the same process)
+    if not hasattr(trigger_intelligence_layer, "_timer"):
+        trigger_intelligence_layer._timer = None
+        trigger_intelligence_layer._pending_scenarios = []
+        trigger_intelligence_layer._lock = _th.Lock()
+        trigger_intelligence_layer._group_name = None
 
-    body = _json.dumps({
-        "batch_id": batch_id,
-        "group_name": payload.group_name,
-        "pend_l2": [payload.scenario_id],
-        "pend_l1": [],
-    }).encode()
+    def _fire():
+        with trigger_intelligence_layer._lock:
+            scenarios = list(trigger_intelligence_layer._pending_scenarios)
+            group     = trigger_intelligence_layer._group_name
+            trigger_intelligence_layer._pending_scenarios.clear()
+            trigger_intelligence_layer._timer = None
 
-    try:
-        req = _ur.Request(IL_WEBHOOK, data=body, headers={"Content-Type": "application/json"}, method="POST")
-        with _ur.urlopen(req, timeout=15) as r:
-            resp_text = r.read().decode()[:200]
-        return {"ok": True, "status": r.status, "response": resp_text}
-    except Exception as e:
-        # Non-fatal — log and return so the dashboard still shows success
-        return {"ok": False, "error": str(e)}
+        batch_id = (group or "batch") + "_" + _dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        body = _json.dumps({
+            "batch_id":   batch_id,
+            "group_name": group,
+            "pend_l2":    scenarios,  # all scenarios reviewed during the window
+            "pend_l1":    [],
+        }).encode()
+
+        try:
+            req = _ur.Request(IL_WEBHOOK, data=body,
+                              headers={"Content-Type": "application/json"}, method="POST")
+            with _ur.urlopen(req, timeout=15):
+                pass
+        except Exception as e:
+            print(f"[IL trigger] webhook error (non-fatal): {e}")
+
+    with trigger_intelligence_layer._lock:
+        # Accumulate reviewed scenario into the pending list
+        trigger_intelligence_layer._pending_scenarios.append(payload.scenario_id)
+        trigger_intelligence_layer._group_name = payload.group_name
+
+        # Cancel the previous timer and start a fresh one
+        if trigger_intelligence_layer._timer is not None:
+            trigger_intelligence_layer._timer.cancel()
+        t = _th.Timer(DEBOUNCE_SECONDS, _fire)
+        t.daemon = True
+        t.start()
+        trigger_intelligence_layer._timer = t
+
+    pending_count = len(trigger_intelligence_layer._pending_scenarios)
+    return {
+        "ok": True,
+        "queued": payload.scenario_id,
+        "pending_count": pending_count,
+        "fires_in_seconds": DEBOUNCE_SECONDS,
+        "message": f"IL will fire in {DEBOUNCE_SECONDS}s if no further reviews are submitted. {pending_count} review(s) queued.",
+    }
 
 
 def get_audit_db():
