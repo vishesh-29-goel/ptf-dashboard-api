@@ -617,12 +617,14 @@ def trigger_intelligence_layer(payload: TriggerILPayload, background_tasks: Back
     IL_WEBHOOK = "https://api-us.zamp.ai/triggers/hooks/ACMVhqqRYXqhBQVs-ydEcse41xntJRHWt2Eae4jLanc"
 
     def _fire():
+        import os as _os
         batch_id = (payload.group_name or "batch") + "_" + _dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         body = _json.dumps({
-            "batch_id":   batch_id,
-            "group_name": payload.group_name,
-            "pend_l2":    [payload.scenario_id],
-            "pend_l1":    [],
+            "batch_id":        batch_id,
+            "group_name":      payload.group_name,
+            "pend_l2":         [payload.scenario_id],
+            "pend_l1":         [],
+            "ptf_database_url": _os.environ.get("DATABASE_URL", ""),
         }).encode()
         try:
             req = _ur.Request(IL_WEBHOOK, data=body,
